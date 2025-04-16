@@ -7,6 +7,7 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
     (search, runtime, render, email, file, record) => {
         const SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH = 'custscript_tsc_ohs27_eligible_ach_paymen';
         const SCRIPT_PARAM_EMAIL_AUTHOR = 'custscript_tsc_ohs27_email_author';
+        const VENDOR_PAYMENT_FIELD_EMAIL_SENT = "custbody_tsc_ach_auto_email_sent";
         /**
          * Defines the function that is executed at the beginning of the map/reduce process and generates the input data.
          * @param {Object} inputContext
@@ -157,6 +158,19 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
 
                 try{
                     email.send(emailObj);
+                    //Update transactionids' status to 'Email Sent' true
+                    transactionsId.forEach((transactionId) => {
+                        let vendorPaymentRecord = record.load({
+                            type: record.Type.VENDOR_PAYMENT,
+                            id: transactionId,
+                            isDynamic: true
+                        });
+                        vendorPaymentRecord.setValue({
+                            fieldId: VENDOR_PAYMENT_FIELD_EMAIL_SENT,
+                            value: true
+                        });
+                        vendorPaymentRecord.save();
+                    });
                 }catch(sendEmailError){
                     log.error('sendEmail', sendEmailError);                    
                 }
