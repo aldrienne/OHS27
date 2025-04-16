@@ -2,10 +2,11 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  */
-define(['N/search', 'N/runtime'],
-    
-    (search, runtime) => {
+define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
+
+    (search, runtime, render, email, file, record) => {
         const SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH = 'custscript_tsc_ohs27_eligible_ach_paymen';
+        const SCRIPT_PARAM_EMAIL_AUTHOR = 'custscript_tsc_ohs27_email_author';
         /**
          * Defines the function that is executed at the beginning of the map/reduce process and generates the input data.
          * @param {Object} inputContext
@@ -20,15 +21,15 @@ define(['N/search', 'N/runtime'],
          */
 
         const getInputData = (inputContext) => {
-            try{
-                const searchId = runtime.getCurrentScript().getParameter({name: SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH});
+            try {
+                const searchId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH });
                 log.debug('searchId', searchId);
 
-                if(searchId){
-                    return search.load({id: searchId});
+                if (searchId) {
+                    return search.load({ id: searchId });
                 }
 
-            }catch(e){
+            } catch (e) {
                 log.error('getInputData', e);
             }
         }
@@ -54,20 +55,20 @@ define(['N/search', 'N/runtime'],
             try {
                 // Log incoming data for debugging
                 log.debug('Map Input', { key: mapContext.key, value: mapContext.value });
-                
+
                 // Parse the value once
                 const searchResult = JSON.parse(mapContext.value);
                 const values = searchResult.values;
-                
+
                 // Validate required fields
                 if (!values.account || !values.account.value) {
                     throw new Error('Account value is missing in search result');
                 }
-                
+
                 // Extract account ID (will be our output key)
                 const accountId = values.account.value + "_" + values.entity.value;
                 log.debug('Processing Account ID', accountId);
-                
+
                 // Build normalized order object with all needed fields
                 const orderObj = {
                     orderId: mapContext.key,
@@ -77,13 +78,13 @@ define(['N/search', 'N/runtime'],
                     orderNumber: values.tranid || '',
                     entity: values.entity ? values.entity.text : '',
                 };
-                
+
                 // Pass to reduce stage grouped by account ID
                 mapContext.write({
                     key: accountId,
                     value: orderObj
                 });
-                
+
             } catch (e) {
                 log.error({
                     title: 'Error in map function',
@@ -108,9 +109,59 @@ define(['N/search', 'N/runtime'],
          * @since 2015.2
          */
         const reduce = (reduceContext) => {
-            try{
+            try {
                 log.debug(reduceContext.key, reduceContext.values);
-            }catch(e){
+                let vendorId = reduceContext.key.split('_')[1];
+                let accountId = reduceContext.key.split('_')[0];
+                let emailTemplateId = searchRelatedEmailTemplate(accountId);
+                log.debug('Email Template ID', emailTemplateId);
+                let authorId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_EMAIL_AUTHOR });
+                log.debug('Email Author ID', authorId);
+
+                let transactionsId = [];
+
+                reduceContext.values.forEach((value) => {
+                    let orderObj = JSON.parse(value);
+                    transactionsId.push(orderObj.orderId);
+                });
+                log.debug('Transactions ID', transactionsId);
+
+                // Generate individual payment vouchers
+                let pdfFiles = generateIndividualPaymentVoucher(transactionsId);
+                log.debug('Generated PDF Files', pdfFiles);
+
+                //Merge Email
+                var mergeResult = render.mergeEmail({
+                    templateId: emailTemplateId,
+                    entity: {
+                        type: 'employee',
+                        id: parseInt(authorId)
+                    },
+                    recipient: {
+                        type: 'vendor',
+                        id: parseInt(vendorId)
+                    }
+                });
+
+                //Construct emailObj
+                
+                let emailObj = {
+                    author: authorId,
+                    recipients: vendorId,
+                    subject: mergeResult.subject,
+                    body: mergeResult.body,
+                    attachments: pdfFiles,
+                }
+
+                log.debug('Email Object', emailObj);
+
+                try{
+                    email.send(emailObj);
+                }catch(sendEmailError){
+                    log.error('sendEmail', sendEmailError);                    
+                }
+
+            } catch (e) {
                 log.error('reduce', e);
             }
         }
@@ -139,6 +190,84 @@ define(['N/search', 'N/runtime'],
 
         }
 
-        return {getInputData, map, reduce, summarize}
+        const searchRelatedEmailTemplate = (accountId) => {
+            try {
+                // Create search for email template mapping
+                const emailTemplateSearch = search.create({
+                    type: 'customrecord_tsc_acct_email_template_map',
+                    filters: [
+                        ['custrecord_tsc_account', 'anyof', accountId]
+                    ],
+                    columns: ['custrecord_tsc_email_template_id']
+                });
+
+                // Run search and get results
+                const searchResult = emailTemplateSearch.run().getRange({
+                    start: 0,
+                    end: 1
+                });
+
+                // Return template ID if found
+                if (searchResult.length > 0) {
+                    return searchResult[0].getValue('custrecord_tsc_email_template_id');
+                } else {
+                    throw new Error('No email template found for account ID: ' + accountId);
+                }
+            } catch (e) {
+                log.error('searchRelatedEmailTemplate', e);
+                throw e;
+            }
+        }
+
+        const generateIndividualPaymentVoucher = (transactionIds) => {
+            
+            let pdfFiles = [];
+        
+            transactionIds.forEach((transactionId) => {
+                try {
+                    // Create renderer
+                    let renderer = render.create();
+                    
+                    // Set template
+                    renderer.setTemplateByScriptId({
+                        scriptId: 'CUSTTMPL_209_9131134_SB1_991_2'
+                    });
+                    
+                    // Add record
+                    renderer.addRecord({
+                        templateName: 'record',
+                        record: record.load({
+                            type: 'vendorpayment',
+                            id: transactionId
+                        })
+                    });
+                    
+                    // Render PDF
+                    let pdfContent = renderer.renderAsPdf();
+                    
+                    // Create file record
+                    let pdfFile = file.create({
+                        name: 'ACH_Payment_' + transactionId + '.pdf',
+                        fileType: file.Type.PDF,
+                        contents: pdfContent.getContents(),
+                        folder: 36472 // Your folder ID
+                    });                
+                    
+                    // Add the file ID to the array
+                    pdfFiles.push(pdfFile);                    
+                } catch (e) {
+                    log.error('Error generating PDF for transaction ' + transactionId, e);
+                }
+            });
+            
+            return pdfFiles;
+        };
+
+        const sendEmail = () =>{
+
+        }
+
+
+        return { getInputData, map, reduce, summarize }
 
     });
