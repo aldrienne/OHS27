@@ -28,33 +28,33 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
                 const searchId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH });
                 const printTemplateId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_PRINT_TEMPLATE_ID });
                 const authorId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_EMAIL_AUTHOR });
-                
+
                 // Log parameters for debugging
                 log.audit('Script Parameters', {
                     searchId: searchId,
                     printTemplateId: printTemplateId,
                     authorId: authorId
                 });
-                
+
                 // Validate each parameter individually
                 const missingParams = [];
-                
+
                 if (!searchId) missingParams.push('Eligible ACH Payments Search');
                 if (!printTemplateId) missingParams.push('Print Template ID');
                 if (!authorId) missingParams.push('Email Author');
-                
+
                 if (missingParams.length > 0) {
                     throw new Error(`Required script parameter(s) not configured: ${missingParams.join(', ')}`);
                 }
-                
+
                 // Validate search exists and count records
-                try {                    
+                try {
                     const searchObj = search.load({ id: searchId });
-                    
+
                     const resultCount = searchObj.runPaged().count;
-                    
+
                     log.audit('Input Data Records', `Found ${resultCount} eligible payment records to process`);
-                    
+
                     // Return the search object for processing
                     return searchObj;
                 } catch (loadError) {
@@ -82,7 +82,6 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
          * @param {string} mapContext.value - Value to be processed during the map stage
          * @since 2015.2
          */
-
         const map = (mapContext) => {
             try {
                 // Log incoming data for debugging
@@ -92,35 +91,77 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
                 const searchResult = JSON.parse(mapContext.value);
                 const values = searchResult.values;
 
-                // Validate required fields
-                if (!values.account || !values.account.value) {
-                    throw new Error('Account value is missing in search result');
+                // Validate all required fields
+                const missingFields = [];
+
+                // Check for required fields
+                if (!values.account || !values.account.value) missingFields.push('account');
+                if (!values.entity || !values.entity.value) missingFields.push('entity');
+                if (!values.trandate) missingFields.push('transaction date');
+                if (!values.tranid) missingFields.push('transaction ID');
+                if (!values['email.vendor']) missingFields.push('vendor email');
+
+                // If any required fields are missing, write to a special "skipped" key
+                if (missingFields.length > 0) {
+                    log.error({
+                        title: 'Skipping record with missing required fields',
+                        details: `Record ID: ${mapContext.key}, Missing fields: ${missingFields.join(', ')}`
+                    });
+
+                    // Write to a special key for skipped records
+                    mapContext.write({
+                        key: 'SKIPPED_RECORDS',
+                        value: JSON.stringify({
+                            recordId: mapContext.key,
+                            tranid: values.tranid || 'N/A',
+                            entity: values.entity ? values.entity.text || 'N/A' : 'N/A',
+                            accountId: values.account ? values.account.value || 'N/A' : 'N/A',
+                            entityId: values.entity ? values.entity.value || 'N/A' : 'N/A',
+                            errorNote: `Missing required fields: ${missingFields.join(', ')}`,
+                            missingFields: missingFields
+                        })
+                    });
+                    return; // Exit early
                 }
 
-                // Extract account ID (will be our output key)
+                // Regular processing continues as before...
                 const accountId = values.account.value + "_" + values.entity.value;
-                log.debug('Processing Account ID', accountId);
 
                 // Build normalized order object with all needed fields
                 const orderObj = {
                     orderId: mapContext.key,
                     accountId: accountId,
-                    orderDate: values.trandate || '',
+                    orderDate: values.trandate,
                     postingPeriod: values.postingperiod ? values.postingperiod.text : '',
-                    orderNumber: values.tranid || '',
-                    entity: values.entity ? values.entity.text : '',
+                    orderNumber: values.tranid,
+                    entity: values.entity.text,
+                    vendorEmail: values["email.vendor"] || '',
                 };
 
                 // Pass to reduce stage grouped by account ID
                 mapContext.write({
                     key: accountId,
-                    value: orderObj
+                    value: JSON.stringify(orderObj)
                 });
 
             } catch (e) {
+                // Also capture errors in a special key
+                mapContext.write({
+                    key: 'ERROR_RECORDS',
+                    value: JSON.stringify({
+                        recordId: mapContext.key,
+                        tranid: values && values.tranid ? values.tranid : 'N/A',
+                        entity: values && values.entity ? values.entity.text : 'N/A',
+                        accountId: values && values.account ? values.account.value : 'N/A',
+                        entityId: values && values.entity ? values.entity.value : 'N/A',
+                        errorNote: `Error processing record: ${e.message}`,
+                        error: e.message
+                    })
+                });
+
                 log.error({
-                    title: 'Error in map function',
-                    details: `Order ID: ${mapContext.key}, Error: ${e.message}`
+                    title: 'Error processing record in map function',
+                    details: `Record ID: ${mapContext.key}, Error: ${e.message}`
                 });
             }
         }
@@ -142,6 +183,26 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
          */
         const reduce = (reduceContext) => {
             try {
+                const key = reduceContext.key;
+
+                // Handle special keys for skipped or error records
+                if (key === 'SKIPPED_RECORDS' || key === 'ERROR_RECORDS') {
+                    // Just pass through these records to summarize
+                    // Combine all values into a single array for easier processing
+                    let records = [];
+                    reduceContext.values.forEach(value => {
+                        records.push(JSON.parse(value));
+                    });
+
+                    // Write back out with the same key for the summarize stage
+                    reduceContext.write({
+                        key: key,
+                        value: JSON.stringify(records)
+                    });
+
+                    // Exit early - no further processing needed for these records
+                    return;
+                }
                 log.debug(reduceContext.key, reduceContext.values);
                 let vendorId = reduceContext.key.split('_')[1];
                 let accountId = reduceContext.key.split('_')[0];
@@ -176,7 +237,7 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
                 });
 
                 //Construct emailObj
-                
+
                 let emailObj = {
                     author: authorId,
                     recipients: vendorId,
@@ -187,7 +248,7 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
 
                 log.debug('Email Object', emailObj);
 
-                try{
+                try {
                     email.send(emailObj);
                     //Update transactionids' status to 'Email Sent' true
                     transactionsId.forEach((transactionId) => {
@@ -202,8 +263,8 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
                         });
                         vendorPaymentRecord.save();
                     });
-                }catch(sendEmailError){
-                    log.error('sendEmail', sendEmailError);                    
+                } catch (sendEmailError) {
+                    log.error('sendEmail', sendEmailError);
                 }
 
             } catch (e) {
@@ -232,7 +293,114 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
          * @since 2015.2
          */
         const summarize = (summaryContext) => {
-
+            try {
+                let skippedRecords = [];
+                let errorRecords = [];
+                let processedRecordsCount = 0;
+                
+                // Process output from reduce stage
+                summaryContext.output.iterator().each(function(key, value) {
+                    if (key === 'SKIPPED_RECORDS') {
+                        skippedRecords = JSON.parse(value);
+                        log.audit('Skipped Records', `Found ${skippedRecords.length} skipped records`);
+                    } else if (key === 'ERROR_RECORDS') {
+                        errorRecords = JSON.parse(value);
+                        log.audit('Error Records', `Found ${errorRecords.length} error records`);
+                    } else {
+                        // Count normal processed records
+                        processedRecordsCount++;
+                    }
+                    return true; // Continue iteration
+                });
+                
+                // Create summary report with detailed information
+                const summaryReport = {
+                    totalRecordsProcessed: summaryContext.inputSummary.totalRecords,
+                    successfullyProcessed: processedRecordsCount,
+                    skippedRecords: {
+                        count: skippedRecords.length,
+                        details: skippedRecords.map(record => ({
+                            recordId: record.recordId,
+                            tranid: record.tranid,
+                            entity: record.entity,
+                            accountId: record.accountId,
+                            entityId: record.entityId,
+                            errorNote: record.errorNote
+                        }))
+                    },
+                    errorRecords: {
+                        count: errorRecords.length,
+                        details: errorRecords.map(record => ({
+                            recordId: record.recordId,
+                            tranid: record.tranid,
+                            entity: record.entity,
+                            accountId: record.accountId,
+                            entityId: record.entityId,
+                            errorNote: record.errorNote
+                        }))
+                    }
+                };
+                
+                log.audit('Processing Summary', summaryReport);
+                
+                // If there are skipped or error records, send notification
+                if (skippedRecords.length > 0 || errorRecords.length > 0) {
+                    let recipient = 'admin@yourcompany.com'; // Replace with actual email
+                    let subject = `ACH Payment Processing Report: ${skippedRecords.length} Skipped, ${errorRecords.length} Errors`;
+                    
+                    // Build HTML table for better email formatting
+                    let bodyHtml = `
+                    <h2>ACH Payment Processing Report</h2>
+                    <p>Total Records: ${summaryReport.totalRecordsProcessed}</p>
+                    <p>Successfully Processed: ${summaryReport.successfullyProcessed}</p>`;
+                    
+                    if (skippedRecords.length > 0) {
+                        bodyHtml += `
+                        <h3>Skipped Records (${skippedRecords.length})</h3>
+                        <table border="1" cellpadding="4">
+                            <tr>
+                                <th>Transaction ID</th>
+                                <th>Vendor</th>
+                                <th>Account</th>
+                                <th>Error Description</th>
+                            </tr>`;
+                        
+                        skippedRecords.forEach(record => {
+                            bodyHtml += `
+                            <tr>
+                                <td>${record.tranid}</td>
+                                <td>${record.entity}</td>
+                                <td>${record.accountId}</td>
+                                <td>${record.errorNote}</td>
+                            </tr>`;
+                        });
+                        
+                        bodyHtml += `</table>`;
+                    }
+                    
+                    if (errorRecords.length > 0) {
+                        // Similar HTML table for error records
+                        // ...
+                    }
+                    
+                    // Send email notification with the HTML report
+                    email.send({
+                        author: runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_EMAIL_AUTHOR }),
+                        recipients: recipient,
+                        subject: subject,
+                        body: bodyHtml,
+                        isHtml: true
+                    });
+                }
+                
+                // Log processing metrics
+                log.audit('Usage units consumed', summaryContext.usage);
+                log.audit('Concurrency', summaryContext.concurrency);
+                log.audit('Number of yields', summaryContext.yields);
+                
+            } catch (e) {
+                log.error('Error in summarize stage', e);
+            }
         }
 
         const searchRelatedEmailTemplate = (accountId) => {
@@ -265,19 +433,19 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
         }
 
         const generateIndividualPaymentVoucher = (transactionIds) => {
-            
+
             let pdfFiles = [];
-        
+
             transactionIds.forEach((transactionId) => {
                 try {
                     // Create renderer
                     let renderer = render.create();
-                    
+
                     // Set template
                     renderer.setTemplateByScriptId({
                         scriptId: runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_PRINT_TEMPLATE_ID })
                     });
-                    
+
                     // Add record
                     renderer.addRecord({
                         templateName: 'record',
@@ -286,32 +454,27 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
                             id: transactionId
                         })
                     });
-                    
+
                     // Render PDF
                     let pdfContent = renderer.renderAsPdf();
-                    
+
                     // Create file record
                     let pdfFile = file.create({
                         name: 'ACH_Payment_' + transactionId + '.pdf',
                         fileType: file.Type.PDF,
                         contents: pdfContent.getContents(),
                         folder: 36472 // Your folder ID
-                    });                
-                    
+                    });
+
                     // Add the file ID to the array
-                    pdfFiles.push(pdfFile);                    
+                    pdfFiles.push(pdfFile);
                 } catch (e) {
                     log.error('Error generating PDF for transaction ' + transactionId, e);
                 }
             });
-            
+
             return pdfFiles;
         };
-
-        const sendEmail = () =>{
-
-        }
-
 
         return { getInputData, map, reduce, summarize }
 
