@@ -7,6 +7,7 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
     (search, runtime, render, email, file, record) => {
         const SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH = 'custscript_tsc_ohs27_eligible_ach_paymen';
         const SCRIPT_PARAM_EMAIL_AUTHOR = 'custscript_tsc_ohs27_email_author';
+        const SCRIPT_PARAM_PRINT_TEMPLATE_ID = "custscript_tsc_ohs27_print_template_id";
         const VENDOR_PAYMENT_FIELD_EMAIL_SENT = "custbody_tsc_ach_auto_email_sent";
         /**
          * Defines the function that is executed at the beginning of the map/reduce process and generates the input data.
@@ -23,15 +24,45 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
 
         const getInputData = (inputContext) => {
             try {
+                // Get all required parameters
                 const searchId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_ELIGIBLE_ACH_PAYMENTS_SEARCH });
-                log.debug('searchId', searchId);
-
-                if (searchId) {
-                    return search.load({ id: searchId });
+                const printTemplateId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_PRINT_TEMPLATE_ID });
+                const authorId = runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_EMAIL_AUTHOR });
+                
+                // Log parameters for debugging
+                log.audit('Script Parameters', {
+                    searchId: searchId,
+                    printTemplateId: printTemplateId,
+                    authorId: authorId
+                });
+                
+                // Validate each parameter individually
+                const missingParams = [];
+                
+                if (!searchId) missingParams.push('Eligible ACH Payments Search');
+                if (!printTemplateId) missingParams.push('Print Template ID');
+                if (!authorId) missingParams.push('Email Author');
+                
+                if (missingParams.length > 0) {
+                    throw new Error(`Required script parameter(s) not configured: ${missingParams.join(', ')}`);
                 }
-
+                
+                // Validate search exists and count records
+                try {                    
+                    const searchObj = search.load({ id: searchId });
+                    
+                    const resultCount = searchObj.runPaged().count;
+                    
+                    log.audit('Input Data Records', `Found ${resultCount} eligible payment records to process`);
+                    
+                    // Return the search object for processing
+                    return searchObj;
+                } catch (loadError) {
+                    throw new Error(`Invalid search ID (${searchId}): ${loadError.message}`);
+                }
             } catch (e) {
-                log.error('getInputData', e);
+                log.error('Error in getInputData', e);
+                throw e; // Re-throw to halt script execution when parameters aren't properly configured
             }
         }
 
@@ -244,7 +275,7 @@ define(['N/search', 'N/runtime', 'N/render', 'N/email', 'N/file', 'N/record'],
                     
                     // Set template
                     renderer.setTemplateByScriptId({
-                        scriptId: 'CUSTTMPL_209_9131134_SB1_991_2'
+                        scriptId: runtime.getCurrentScript().getParameter({ name: SCRIPT_PARAM_PRINT_TEMPLATE_ID })
                     });
                     
                     // Add record
